@@ -1,0 +1,5 @@
+rm -rf /var/log/testlogs
+rm -f /var/log/testlogs/*
+df -h
+help
+mkdir --help
