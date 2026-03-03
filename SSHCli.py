@@ -422,119 +422,108 @@ class SSHGUI(tk.Tk):
     def _create_conn_frame(self, parent):
         conn_frame = ttk.LabelFrame(parent, text="Параметры подключения")
         conn_frame.grid(row=0, column=0, sticky="ew", pady=5)
-
-        # column weights
-        conn_frame.columnconfigure(0, weight=0)
-        conn_frame.columnconfigure(1, weight=1)
-        conn_frame.columnconfigure(2, weight=0)
-        conn_frame.columnconfigure(3, weight=1)
-        conn_frame.columnconfigure(4, weight=0, minsize=80)
-        conn_frame.columnconfigure(5, weight=0, minsize=80)
-
-        # IP / hostname
-        ttk.Label(conn_frame, text="IP / hostname:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        self.entry_host = ttk.Entry(conn_frame, width=30)
-        self.entry_host.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
-
-        # Port
-        ttk.Label(conn_frame, text="Порт (22):").grid(row=0, column=2, sticky="e", padx=5, pady=2)
-        self.entry_port = ttk.Entry(conn_frame, width=10)
+        
+        # Настраиваем колонки для равномерного распределения
+        for i in range(8):
+            conn_frame.columnconfigure(i, weight=1 if i in (1,3,5) else 0)
+        
+        # Строка 1: Хост, Порт, Логин, Пароль в одной строке
+        ttk.Label(conn_frame, text="Хост:").grid(row=0, column=0, sticky="e", padx=2, pady=1)
+        self.entry_host = ttk.Entry(conn_frame)
+        self.entry_host.grid(row=0, column=1, sticky="ew", padx=2, pady=1)
+        
+        ttk.Label(conn_frame, text="Порт:").grid(row=0, column=2, sticky="e", padx=2, pady=1)
+        self.entry_port = ttk.Entry(conn_frame, width=8)
         self.entry_port.insert(0, "22")
-        self.entry_port.grid(row=0, column=3, sticky="w", padx=5, pady=2)
-
-        # Login
-        ttk.Label(conn_frame, text="Логин (root):").grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        self.entry_user = ttk.Entry(conn_frame, width=30)
-        self.entry_user.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
-
-        # Password
-        ttk.Label(conn_frame, text="Пароль:").grid(row=1, column=2, sticky="e", padx=5, pady=2)
-        self.entry_pass = ttk.Entry(conn_frame, width=30, show="*")
-        self.entry_pass.grid(row=1, column=3, sticky="ew", padx=5, pady=2)
-
-        # Saved connections combobox
-        ttk.Label(conn_frame, text="Ранее\nСохранённые:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        self.entry_port.grid(row=0, column=3, sticky="ew", padx=2, pady=1)
+        
+        ttk.Label(conn_frame, text="Логин:").grid(row=0, column=4, sticky="e", padx=2, pady=1)
+        self.entry_user = ttk.Entry(conn_frame)
+        self.entry_user.grid(row=0, column=5, sticky="ew", padx=2, pady=1)
+        
+        ttk.Label(conn_frame, text="Пароль:").grid(row=0, column=6, sticky="e", padx=2, pady=1)
+        self.entry_pass = ttk.Entry(conn_frame, show="*")
+        self.entry_pass.grid(row=0, column=7, sticky="ew", padx=2, pady=1)
+        
+        # Строка 2: Сохранённые соединения + кнопки
+        ttk.Label(conn_frame, text="Сохранённые:").grid(row=1, column=0, sticky="e", padx=2, pady=1)
         self.combo_var = tk.StringVar()
         self.combo_box = ttk.Combobox(conn_frame, textvariable=self.combo_var, state="readonly")
-        self.combo_box.grid(row=2, column=1, columnspan=3, sticky="ew", padx=5, pady=2)
+        self.combo_box.grid(row=1, column=1, columnspan=5, sticky="ew", padx=2, pady=1)
         self.combo_box.bind("<<ComboboxSelected>>", self._on_combo_selected)
-
-        # Save / Delete buttons
-        button_frame = ttk.Frame(conn_frame)
-        button_frame.grid(row=2, column=4, columnspan=2, sticky="e", padx=5, pady=2)
-
-        self.btn_delete = ttk.Button(button_frame, text="Удалить", command=self._delete_selected_combo)
-        self.btn_delete.pack(side="right")
-        self.btn_save = ttk.Button(button_frame, text="Сохранить", command=self._save_current_combo)
-        self.btn_save.pack(side="right", padx=(0, 5))
-
-        # Connection control buttons
+        
+        # Кнопки Сохранить/Удалить компактно
+        btn_frame = ttk.Frame(conn_frame)
+        btn_frame.grid(row=1, column=6, columnspan=2, sticky="ew", padx=2, pady=1)
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        
+        self.btn_save = ttk.Button(btn_frame, text="💾 Сохранить", command=self._save_current_combo)
+        self.btn_save.grid(row=0, column=0, sticky="ew", padx=1)
+        
+        self.btn_delete = ttk.Button(btn_frame, text="🗑️ Удалить", command=self._delete_selected_combo)
+        self.btn_delete.grid(row=0, column=1, sticky="ew", padx=1)
+        
+        # Строка 3: Управление соединением компактно
         control_frame = ttk.Frame(conn_frame)
-        control_frame.grid(row=3, column=0, columnspan=6, sticky="ew", padx=5, pady=5)
+        control_frame.grid(row=2, column=0, columnspan=8, sticky="ew", pady=2)
+        control_frame.columnconfigure(0, weight=1)
         
-        # Левая часть с кнопками подключения
-        left_control = ttk.Frame(control_frame)
-        left_control.pack(side="left", fill="x", expand=True)
+        # Левая часть с кнопками
+        left = ttk.Frame(control_frame)
+        left.pack(side="left", fill="x", expand=True)
         
-        self.btn_connect = ttk.Button(left_control, text="Установить соединение", command=self._establish_connection)
-        self.btn_connect.pack(side="left", padx=2)
+        self.btn_connect = ttk.Button(left, text="Подключить", width=15, command=self._establish_connection)
+        self.btn_connect.pack(side="left", padx=1)
         
-        self.btn_disconnect = ttk.Button(left_control, text="Закрыть соединение", command=self._close_connection)
-        self.btn_disconnect.pack(side="left", padx=2)
+        self.btn_disconnect = ttk.Button(left, text="Отключить", width=15, command=self._close_connection)
+        self.btn_disconnect.pack(side="left", padx=1)
         
-        # Индикатор загрузки
-        self.loading_label = ttk.Label(left_control, text="", foreground="blue")
-        self.loading_label.pack(side="left", padx=10)
+        self.loading_label = ttk.Label(left, text="", font=("Arial", 10))
+        self.loading_label.pack(side="left", padx=5)
         
-        # Правая часть со статусом
-        right_control = ttk.Frame(control_frame)
-        right_control.pack(side="right")
+        # Правая часть со статусом (компактно)
+        right = ttk.Frame(control_frame)
+        right.pack(side="right")
         
-        ttk.Label(right_control, text="Статус:").pack(side="left")
-        self.lbl_connection_status = ttk.Label(right_control, text="Не подключено", foreground="red")
-        self.lbl_connection_status.pack(side="left", padx=5)
+        # Статус в виде индикатора
+        self.lbl_connection_status = ttk.Label(right, text="●", font=("Arial", 12))
+        self.lbl_connection_status.pack(side="left", padx=2)
         
-        self.lbl_connection_path = ttk.Label(right_control, text="")
-        self.lbl_connection_path.pack(side="left", padx=5)
-
+        self.lbl_connection_path = ttk.Label(right, text="[нет подключения]", foreground="gray")
+        self.lbl_connection_path.pack(side="left", padx=2)
     def _create_btn_frame(self, parent):
         btn_frame = ttk.LabelFrame(parent, text="Быстрые команды")
         btn_frame.grid(row=1, column=0, sticky="ew", pady=5)
-        btn_frame.columnconfigure(0, weight=0)
-        btn_frame.columnconfigure(1, weight=0)
-
-        # Первая строка кнопок
-        #row1_frame = ttk.Frame(btn_frame)
-        #row1_frame.pack(fill="x", padx=5, pady=2)
-        
-        self.btn_1 = ttk.Button(btn_frame, text="help", command=lambda: self._insert_command("help"))
-        self.btn_1.grid(row=0, column=0, sticky="w", padx=2)
-
-        self.btn_2 = ttk.Button(btn_frame, text="pwd", command=lambda: self._insert_command("pwd"))
-        self.btn_2.grid(row=0, column=1, sticky="w", padx=2)
-
-        self.btn_3 = ttk.Button(btn_frame, text="список файлов", command=lambda: self._insert_command("ls -la"))
-        self.btn_3.grid(row=0, column=2, sticky="w", padx=2)
-
-        self.btn_4 = ttk.Button(btn_frame, text="свободное место", command=lambda: self._insert_command("df -h"))
-        self.btn_4.grid(row=0, column=3, sticky="w", padx=2)
-
-        # Вторая строка кнопок
-        #row2_frame = ttk.Frame(btn_frame)
-        #row2_frame.pack(fill="x", padx=5, pady=2)
-        
-        self.btn_5 = ttk.Button(btn_frame, text="Удалить файлы", command=lambda: self._insert_command("rm -f /var/log/test_logs/*"))
-        self.btn_5.grid(row=1, column=0, sticky="w", padx=2)
-
-        self.btn_6 = ttk.Button(btn_frame, text="Удалить каталог", command=lambda: self._insert_command("rm -rf /var/log/test_logs"))
-        self.btn_6.grid(row=1, column=1, sticky="w", padx=2)
-
-        self.btn_7 = ttk.Button(btn_frame, text="Справка", command=self.infos)
-        self.btn_7.grid(row=1, column=2, sticky="w", padx=2)
-
-        #self.btn_8 = ttk.Button(row2_frame, text="Обновить статус", command=self._refresh_status)
-        #self.btn_8.pack(side="left", padx=2)
-
+        cols = 4
+        for i in range(cols):
+            btn_frame.columnconfigure(i, weight=1, uniform="btn")
+        # Список кнопок: (текст, команда)
+        buttons = [
+            ("help", "help"),
+            ("где я", "pwd"),
+            ("список файлов", "ls -la"),
+            ("свободное место", "df -h"),
+            ("очистить директорию", "rm -f /tmp/*"),
+            ("удалить директорию", "rm -rf /tmp/dir"),
+            ("создать директорию", "mkdir test"),
+            ("touch file", "touch test.txt"),
+            ("прочитать файл", "cat /etc/passwd"),
+            ("список процессов", "ps aux | head"),
+            ("Справка", "info"),
+        ]
+        # Размещаем кнопки в сетке
+        for i, (text, cmd) in enumerate(buttons):
+            row = i // cols
+            col = i % cols
+            
+            if cmd == "info":
+                btn = ttk.Button(btn_frame, text=text, command=self.infos)
+            else:
+                btn = ttk.Button(btn_frame, text=text, 
+                               command=lambda x=cmd: self._insert_command(x))
+            btn.grid(row=row, column=col, padx=2, pady=2, sticky="ew")
+    
 
     def _insert_command(self, command):
         """Вставляет команду в поле произвольной команды"""
