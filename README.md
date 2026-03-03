@@ -8,7 +8,7 @@
 * ранее введенные команды храняться в отдельном файле списке - history.txt
 * не требует установки и зависимостей, код на питоне, исходник открыт
 
-![Screenshot_3](https://github.com/user-attachments/assets/27b9e96e-509f-4ace-a8ea-7bc4293ae63d)
+![Screenshot_3](https://github.com/user-attachments/assets/c0170b46-db28-4a5e-b180-38a8843e267c)
 
 
 #### find me on discord [![Discord](https://discordapp.com/api/guilds/626106205122592769/widget.png?style=shield)](https://discord.gg/qYmBmDR)
