@@ -7,6 +7,7 @@ import threading
 import paramiko
 import tkinter as tk
 import webbrowser
+import time
 
 import hashlib
 import base64
@@ -21,18 +22,223 @@ SAVED_FILE   = "save.json"           # сохранённые соединени
 HISTORY_FILE = "history.txt"         # история команд
 
 # ----------------------------------------------------------------------
+# Класс для управления постоянным SSH-соединением
+# ----------------------------------------------------------------------
+class SSHConnection:
+    def __init__(self):
+        self.client = None
+        self.sftp = None
+        self.current_path = None
+        self.host = None
+        self.port = None
+        self.username = None
+        self.password = None
+        self.lock = threading.Lock()
+        self.connecting = False
+        self.connected = False
+    
+    def is_connected(self):
+        """Проверяет, активно ли соединение"""
+        if self.client and self.client.get_transport() and self.client.get_transport().is_active():
+            return True
+        return False
+    
+    def connect(self, host, port, username, password, output_callback, status_callback=None):
+        """Устанавливает соединение, если его нет (выполняется в потоке)"""
+        with self.lock:
+            if self.connecting:
+                output_callback("[INFO] Уже выполняется подключение...")
+                return False
+            
+            self.connecting = True
+        
+        try:
+            # Если уже подключены к тому же серверу, ничего не делаем
+            if self.is_connected() and self.host == host and self.port == port and self.username == username:
+                output_callback("[INFO] Использую существующее соединение")
+                with self.lock:
+                    self.connecting = False
+                if status_callback:
+                    status_callback(True)
+                return True
+            
+            # Закрываем старое соединение, если есть
+            self.close()
+            
+            output_callback(f"[INFO] Устанавливаю новое соединение с {host}:{port}")
+            
+            # Создаём клиент
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            # Подключаемся
+            client.connect(hostname=host, port=port,
+                          username=username, password=password, timeout=10)
+            
+            # Получаем текущую директорию после подключения
+            stdin, stdout, stderr = client.exec_command('pwd')
+            current_path = stdout.read().decode().strip()
+            
+            with self.lock:
+                self.client = client
+                self.current_path = current_path
+                self.host = host
+                self.port = port
+                self.username = username
+                self.password = password
+                self.connecting = False
+                self.connected = True
+            
+            output_callback(f"[INFO] Соединение установлено. Текущая директория: {current_path}")
+            
+            if status_callback:
+                status_callback(True)
+            
+            return True
+            
+        except Exception as e:
+            output_callback(f"[ERROR] Не удалось подключиться: {e}")
+            with self.lock:
+                self.client = None
+                self.connecting = False
+                self.connected = False
+            
+            if status_callback:
+                status_callback(False)
+            
+            return False
+    
+    def execute(self, command, output_callback):
+        """Выполняет команду в существующем соединении"""
+        with self.lock:
+            if not self.is_connected():
+                output_callback("[ERROR] Соединение не установлено или разорвано")
+                return False
+            
+            client = self.client
+            current_path = self.current_path
+        
+        try:
+            # Для команд cd нужно обрабатывать особым образом
+            if command.strip().startswith('cd '):
+                return self._change_directory(command, output_callback)
+            
+            # Выполняем команду в текущей директории
+            full_command = f"cd {current_path} && {command}"
+            stdin, stdout, stderr = client.exec_command(full_command)
+            
+            # Читаем stdout
+            for line in stdout:
+                output_callback(line.rstrip("\n"))
+            
+            # Читаем stderr
+            for line in stderr:
+                output_callback("[ERR] " + line.rstrip("\n"))
+            
+            return True
+            
+        except Exception as e:
+            output_callback(f"[EXCEPTION] {str(e)}")
+            return False
+    
+    def _change_directory(self, command, output_callback):
+        """Обрабатывает команду cd и обновляет текущий путь"""
+        try:
+            with self.lock:
+                client = self.client
+            
+            # Получаем целевую директорию из команды
+            parts = command.strip().split(maxsplit=1)
+            if len(parts) < 2:
+                target_dir = "~"  # cd без аргументов идёт в домашнюю директорию
+            else:
+                target_dir = parts[1]
+            
+            # Выполняем cd и сразу проверяем результат
+            test_command = f"cd {target_dir} && pwd"
+            stdin, stdout, stderr = client.exec_command(test_command)
+            
+            new_path = stdout.read().decode().strip()
+            error = stderr.read().decode().strip()
+            
+            if error:
+                output_callback(f"[ERR] {error}")
+                return False
+            
+            if new_path:
+                with self.lock:
+                    self.current_path = new_path
+                output_callback(f"[INFO] Текущая директория: {new_path}")
+                return True
+            else:
+                output_callback("[ERR] Не удалось сменить директорию")
+                return False
+                
+        except Exception as e:
+            output_callback(f"[EXCEPTION] Ошибка при смене директории: {e}")
+            return False
+    
+    def _update_current_path(self, output_callback):
+        """Обновляет сохранённый текущий путь"""
+        try:
+            with self.lock:
+                client = self.client
+            
+            stdin, stdout, stderr = client.exec_command('pwd')
+            new_path = stdout.read().decode().strip()
+            if new_path:
+                with self.lock:
+                    self.current_path = new_path
+        except Exception as e:
+            output_callback(f"[WARNING] Не удалось обновить путь: {e}")
+    
+    def download_file(self, remote_path, local_path, output_callback):
+        """Скачивает файл через существующее соединение"""
+        with self.lock:
+            if not self.is_connected():
+                output_callback("[ERROR] Соединение не установлено или разорвано")
+                return False
+            
+            client = self.client
+        
+        try:
+            # Создаём SFTP сессию
+            transport = client.get_transport()
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            
+            # Скачиваем файл
+            sftp.get(remote_path, local_path)
+            output_callback(f"[INFO] Файл успешно скачан: {remote_path} → {local_path}")
+            
+            sftp.close()
+            return True
+            
+        except Exception as e:
+            output_callback(f"[ERROR] Не удалось скачать файл: {e}")
+            return False
+    
+    def close(self):
+        """Закрывает соединение"""
+        with self.lock:
+            if self.client:
+                try:
+                    self.client.close()
+                except:
+                    pass
+                self.client = None
+            self.current_path = None
+            self.connected = False
+            self.connecting = False
+
+# ----------------------------------------------------------------------
 # Функции шифрования/дешифрования (простое XOR шифрование)
 # ----------------------------------------------------------------------
 def get_key():
     """Получаем ключ шифрования из переменной окружения или используем фиксированный"""
-    # ВНИМАНИЕ: Для реального использования лучше установить переменную окружения
-    # export SSH_CLIENT_KEY="ваш_секретный_ключ"
     env_key = os.environ.get('SSH_CLIENT_KEY')
     if env_key:
-        # Используем SHA-256 от переменной окружения как ключ
         return hashlib.sha256(env_key.encode()).digest()
     else:
-        # Фиксированный ключ для демонстрации (небезопасно для продакшена!)
         return b'MySuperSecretKey'
 
 def encrypt_password(password):
@@ -41,17 +247,12 @@ def encrypt_password(password):
         return ""
     
     key = get_key()
-    # Преобразуем пароль в байты
     password_bytes = password.encode('utf-8')
-    
-    # XOR шифрование с циклическим повторением ключа
     encrypted_bytes = bytearray()
     key_length = len(key)
     
     for i, byte in enumerate(password_bytes):
         encrypted_bytes.append(byte ^ key[i % key_length])
-    
-    # Кодируем в base64 для безопасного хранения
     return base64.b64encode(encrypted_bytes).decode('ascii')
 
 def decrypt_password(encrypted_data):
@@ -61,10 +262,7 @@ def decrypt_password(encrypted_data):
     
     try:
         key = get_key()
-        # Декодируем из base64
         encrypted_bytes = base64.b64decode(encrypted_data)
-        
-        # XOR дешифрование
         decrypted_bytes = bytearray()
         key_length = len(key)
         
@@ -73,7 +271,6 @@ def decrypt_password(encrypted_data):
         
         return decrypted_bytes.decode('utf-8')
     except Exception:
-        # Если не удалось расшифровать, возвращаем как есть (для обратной совместимости)
         return encrypted_data
 
 def is_encrypted(password_str):
@@ -81,53 +278,14 @@ def is_encrypted(password_str):
     if not password_str:
         return False
     
-    # Проверяем, что строка выглядит как base64 (только ASCII символы)
     try:
-        # Если это валидный base64 и не содержит русских букв
         if all(ord(c) < 128 for c in password_str):
-            # Пробуем декодировать как base64
-            decoded = base64.b64decode(password_str)
-            # Если декодировалось успешно, вероятно это зашифрованный пароль
+            base64.b64decode(password_str)
             return True
     except Exception:
         pass
     
     return False
-
-# ----------------------------------------------------------------------
-# SSH helper (оставьте как есть)
-# ----------------------------------------------------------------------
-def ssh_execute(host, port, username, password, command, output_callback):
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=host, port=port,
-                       username=username, password=password, timeout=10)
-
-        stdin, stdout, stderr = client.exec_command(command)
-        for line in stdout:
-            output_callback(line.rstrip("\n"))
-        for line in stderr:
-            output_callback("[ERR] " + line.rstrip("\n"))
-
-        client.close()
-    except Exception as e:
-        output_callback("[EXCEPTION] " + str(e))
-
-def download_file(host, port, username, password,
-                  remote_path, local_path, output_callback):
-    try:
-        transport = paramiko.Transport((host, port))
-        transport.connect(username=username, password=password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-
-        sftp.get(remote_path, local_path)
-        output_callback(f"[INFO] Файл успешно скачан: {remote_path} → {local_path}")
-
-        sftp.close()
-        transport.close()
-    except Exception as e:
-        output_callback(f"[ERROR] Не удалось скачать файл: {e}")
 
 # ----------------------------------------------------------------------
 # GUI
@@ -139,6 +297,9 @@ class SSHGUI(tk.Tk):
         self.geometry("850x750")
         self.minsize(600, 400)
         self.resizable(True, True)
+
+        # Создаём глобальное SSH соединение
+        self.ssh_connection = SSHConnection()
 
         # Основной контейнер
         main_container = ttk.Frame(self)
@@ -153,9 +314,9 @@ class SSHGUI(tk.Tk):
         content_frame.grid(row=0, column=0, sticky="nsew")
 
         # row/column weights для content_frame
-        for i in range(4):
+        for i in range(5):
             content_frame.rowconfigure(i, weight=0)
-        content_frame.rowconfigure(4, weight=1)          # output expands
+        content_frame.rowconfigure(5, weight=1)
         content_frame.columnconfigure(0, weight=1)
 
         # UI sections
@@ -171,16 +332,74 @@ class SSHGUI(tk.Tk):
         # Load saved connections and history
         self._load_saved_combos()
         self._load_history()
+        
+        # Запускаем периодическое обновление статуса
+        self._update_status_periodically()
 
-    # ------------------------------------------------------------------
-    # Новая функция для создания ссылки внизу
-    # ------------------------------------------------------------------
+    def _update_status_periodically(self):
+        self._refresh_status()
+        # Запускаем снова через 2 секунды
+        self.after(5000, self._update_status_periodically)
+
+    def _establish_connection(self):
+        """Устанавливает соединение с сервером в отдельном потоке"""
+        params = self.get_connection_params()
+        if not params:
+            return
+        
+        host, port, user, password = params
+        
+        # Показываем индикатор загрузки
+        self.loading_label.config(text="⏳ Подключение...")
+        self.btn_connect.config(state="disabled")
+        
+        def connect_thread():
+            success = self.ssh_connection.connect(
+                host, port, user, password, 
+                self.append_output,
+                self._connection_status_callback
+            )
+            # Обновляем UI в главном потоке
+            self.after(0, self._connection_finished, success)
+        
+        threading.Thread(target=connect_thread, daemon=True).start()
+
+    def _connection_finished(self, success):
+        """Вызывается после завершения попытки подключения"""
+        self.loading_label.config(text="")
+        self.btn_connect.config(state="normal")
+        self._refresh_status()
+
+    def _connection_status_callback(self, connected):
+        """Колбэк для обновления статуса из потока"""
+        self.after(0, self._update_connection_status, connected)
+
+    def _close_connection(self):
+        """Закрывает текущее соединение"""
+        self.ssh_connection.close()
+        self._update_connection_status(False)
+        self.append_output("[INFO] Соединение закрыто")
+
+    def _update_connection_status(self, connected):
+        """Обновляет статус соединения в интерфейсе"""
+        if connected and self.ssh_connection.current_path:
+            self.lbl_connection_status.config(
+                text=f"Подключено к {self.ssh_connection.host}:{self.ssh_connection.port}",
+                foreground="green"
+            )
+            self.lbl_connection_path.config(
+                text=f"📁 {self.ssh_connection.current_path}",
+                foreground="blue"
+            )
+        else:
+            self.lbl_connection_status.config(text="Не подключено", foreground="red")
+            self.lbl_connection_path.config(text="")
+
     def _create_bottom_link(self, parent):
         bottom_frame = ttk.Frame(parent)
         bottom_frame.grid(row=1, column=0, sticky="ew", pady=(0, 5))
         bottom_frame.columnconfigure(0, weight=1)
 
-        # Создаем метку с ссылкой
         link_label = tk.Label(
             bottom_frame,
             text="Source github.com/JTNeXuS2",
@@ -189,8 +408,6 @@ class SSHGUI(tk.Tk):
             font=("Arial", 8, "underline")
         )
         link_label.grid(row=0, column=0, sticky="e")
-
-        # Привязываем события
         link_label.bind("<Button-1>", lambda e: self._open_browser())
         link_label.bind("<Enter>", lambda e: link_label.configure(fg="red"))
         link_label.bind("<Leave>", lambda e: link_label.configure(fg="blue"))
@@ -220,13 +437,13 @@ class SSHGUI(tk.Tk):
         self.entry_host.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
 
         # Port
-        ttk.Label(conn_frame, text="Порт (по умолчанию 22):").grid(row=0, column=2, sticky="e", padx=5, pady=2)
+        ttk.Label(conn_frame, text="Порт (22):").grid(row=0, column=2, sticky="e", padx=5, pady=2)
         self.entry_port = ttk.Entry(conn_frame, width=10)
         self.entry_port.insert(0, "22")
         self.entry_port.grid(row=0, column=3, sticky="w", padx=5, pady=2)
 
         # Login
-        ttk.Label(conn_frame, text="Логин (по умолчанию root):").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        ttk.Label(conn_frame, text="Логин (root):").grid(row=1, column=0, sticky="e", padx=5, pady=2)
         self.entry_user = ttk.Entry(conn_frame, width=30)
         self.entry_user.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
 
@@ -236,7 +453,7 @@ class SSHGUI(tk.Tk):
         self.entry_pass.grid(row=1, column=3, sticky="ew", padx=5, pady=2)
 
         # Saved connections combobox
-        ttk.Label(conn_frame, text="Сохранённые:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        ttk.Label(conn_frame, text="Ранее\nСохранённые:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
         self.combo_var = tk.StringVar()
         self.combo_box = ttk.Combobox(conn_frame, textvariable=self.combo_var, state="readonly")
         self.combo_box.grid(row=2, column=1, columnspan=3, sticky="ew", padx=5, pady=2)
@@ -251,38 +468,82 @@ class SSHGUI(tk.Tk):
         self.btn_save = ttk.Button(button_frame, text="Сохранить", command=self._save_current_combo)
         self.btn_save.pack(side="right", padx=(0, 5))
 
-    def _create_btn_frame(self, parent):
-        btn_frame = ttk.Frame(parent)
-        btn_frame.grid(row=1, column=0, sticky="ew", pady=5)
+        # Connection control buttons
+        control_frame = ttk.Frame(conn_frame)
+        control_frame.grid(row=3, column=0, columnspan=6, sticky="ew", padx=5, pady=5)
+        
+        # Левая часть с кнопками подключения
+        left_control = ttk.Frame(control_frame)
+        left_control.pack(side="left", fill="x", expand=True)
+        
+        self.btn_connect = ttk.Button(left_control, text="Установить соединение", command=self._establish_connection)
+        self.btn_connect.pack(side="left", padx=2)
+        
+        self.btn_disconnect = ttk.Button(left_control, text="Закрыть соединение", command=self._close_connection)
+        self.btn_disconnect.pack(side="left", padx=2)
+        
+        # Индикатор загрузки
+        self.loading_label = ttk.Label(left_control, text="", foreground="blue")
+        self.loading_label.pack(side="left", padx=10)
+        
+        # Правая часть со статусом
+        right_control = ttk.Frame(control_frame)
+        right_control.pack(side="right")
+        
+        ttk.Label(right_control, text="Статус:").pack(side="left")
+        self.lbl_connection_status = ttk.Label(right_control, text="Не подключено", foreground="red")
+        self.lbl_connection_status.pack(side="left", padx=5)
+        
+        self.lbl_connection_path = ttk.Label(right_control, text="")
+        self.lbl_connection_path.pack(side="left", padx=5)
 
+    def _create_btn_frame(self, parent):
+        btn_frame = ttk.LabelFrame(parent, text="Быстрые команды")
+        btn_frame.grid(row=1, column=0, sticky="ew", pady=5)
         btn_frame.columnconfigure(0, weight=0)
         btn_frame.columnconfigure(1, weight=0)
 
-        self.btn_1 = ttk.Button(btn_frame, text="Run Help", command=lambda: self._insert_command("help"))
-        self.btn_1.grid(row=0, column=0, sticky="w", padx=5)
+        # Первая строка кнопок
+        #row1_frame = ttk.Frame(btn_frame)
+        #row1_frame.pack(fill="x", padx=5, pady=2)
+        
+        self.btn_1 = ttk.Button(btn_frame, text="help", command=lambda: self._insert_command("help"))
+        self.btn_1.grid(row=0, column=0, sticky="w", padx=2)
 
-        self.btn_2 = ttk.Button(btn_frame, text="Show path", command=lambda: self._insert_command("pwd"))
-        self.btn_2.grid(row=0, column=1, sticky="w", padx=5)
+        self.btn_2 = ttk.Button(btn_frame, text="pwd", command=lambda: self._insert_command("pwd"))
+        self.btn_2.grid(row=0, column=1, sticky="w", padx=2)
 
-        self.btn_3 = ttk.Button(btn_frame, text="Удалить файлы", command=lambda: self._insert_command("rm -f /var/log/test_logs/*"))
-        self.btn_3.grid(row=0, column=2, sticky="w", padx=5)
+        self.btn_3 = ttk.Button(btn_frame, text="список файлов", command=lambda: self._insert_command("ls -la"))
+        self.btn_3.grid(row=0, column=2, sticky="w", padx=2)
 
-        self.btn_4 = ttk.Button(btn_frame, text="Удалить полностью каталог ", command=lambda: self._insert_command("rm -rf /var/log/test_logs"))
-        self.btn_4.grid(row=0, column=3, sticky="w", padx=5)
+        self.btn_4 = ttk.Button(btn_frame, text="свободное место", command=lambda: self._insert_command("df -h"))
+        self.btn_4.grid(row=0, column=3, sticky="w", padx=2)
 
-        self.btn_99 = ttk.Button(btn_frame, text="Справка", command=self.infos)
-        self.btn_99.grid(row=1, column=0, sticky="w", padx=5)
+        # Вторая строка кнопок
+        #row2_frame = ttk.Frame(btn_frame)
+        #row2_frame.pack(fill="x", padx=5, pady=2)
+        
+        self.btn_5 = ttk.Button(btn_frame, text="Удалить файлы", command=lambda: self._insert_command("rm -f /var/log/test_logs/*"))
+        self.btn_5.grid(row=1, column=0, sticky="w", padx=2)
+
+        self.btn_6 = ttk.Button(btn_frame, text="Удалить каталог", command=lambda: self._insert_command("rm -rf /var/log/test_logs"))
+        self.btn_6.grid(row=1, column=1, sticky="w", padx=2)
+
+        self.btn_7 = ttk.Button(btn_frame, text="Справка", command=self.infos)
+        self.btn_7.grid(row=1, column=2, sticky="w", padx=2)
+
+        #self.btn_8 = ttk.Button(row2_frame, text="Обновить статус", command=self._refresh_status)
+        #self.btn_8.pack(side="left", padx=2)
 
 
     def _insert_command(self, command):
         """Вставляет команду в поле произвольной команды"""
         self.entry_custom_var.set(command)
-        # Опционально: устанавливаем фокус на поле ввода
         self.entry_custom.focus_set()
         self.entry_custom.icursor(tk.END)
 
     # ------------------------------------------------------------------
-    # UI – произвольная команда (добавлена кнопка «Удалить»)
+    # UI – произвольная команда
     # ------------------------------------------------------------------
     def _create_custom_frame(self, parent):
         custom_frame = ttk.LabelFrame(parent, text="Произвольная команда")
@@ -290,7 +551,7 @@ class SSHGUI(tk.Tk):
 
         custom_frame.columnconfigure(0, weight=1)
         custom_frame.columnconfigure(1, weight=0)
-        custom_frame.columnconfigure(2, weight=0)   # новая колонка для кнопки Delete
+        custom_frame.columnconfigure(2, weight=0)
 
         # Combobox для истории
         self.entry_custom_var = tk.StringVar()
@@ -299,51 +560,32 @@ class SSHGUI(tk.Tk):
                                         state="normal", width=60)
         self.entry_custom.grid(row=0, column=0, sticky="ew", padx=5, pady=2)
 
-        # Bind selection to just place the selected command in the combobox
-        self.entry_custom.bind("<<ComboboxSelected>>",
-                               lambda e: self._on_history_selected())
-
         # Run button
-        self.btn_custom = ttk.Button(custom_frame,
-                                     text="Выполнить", command=self.run_custom)
+        self.btn_custom = ttk.Button(custom_frame, text="Выполнить", command=self.run_custom)
         self.btn_custom.grid(row=0, column=1, sticky="w", padx=5)
 
-        # Delete button – новая кнопка
-        self.btn_delete_history = ttk.Button(custom_frame,
-                                            text="Удалить",
-                                            command=self._delete_history_command)
+        # Delete button
+        self.btn_delete_history = ttk.Button(custom_frame, text="Удалить из истории", command=self._delete_history_command)
         self.btn_delete_history.grid(row=0, column=2, sticky="w", padx=5)
-
-    def _on_history_selected(self):
-        # The combobox already contains the selected command
-        pass
 
     # ------------------------------------------------------------------
     # UI – скачивание файла
     # ------------------------------------------------------------------
     def _create_download_frame(self, parent):
         download_frame = ttk.LabelFrame(parent, text="Скачивание файла")
-        download_frame.grid(row=3, column=0, sticky="nsew", pady=5)
+        download_frame.grid(row=3, column=0, sticky="ew", pady=5)
 
-        download_frame.rowconfigure(0, weight=0)
-        download_frame.rowconfigure(1, weight=0)
-        download_frame.rowconfigure(2, weight=0)
-        download_frame.columnconfigure(0, weight=0)
         download_frame.columnconfigure(1, weight=1)
-        download_frame.columnconfigure(2, weight=0)
 
-        # Remote Path
         ttk.Label(download_frame, text="Remote Path:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        self.entry_remote = ttk.Entry(download_frame, width=30)
+        self.entry_remote = ttk.Entry(download_frame, width=50)
         self.entry_remote.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
 
-        # Local Path (read‑only)
         ttk.Label(download_frame, text="Local Path:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        self.entry_local = ttk.Entry(download_frame, width=30, state="readonly")
+        self.entry_local = ttk.Entry(download_frame, width=50, state="readonly")
         self.entry_local.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
 
-        # Download button
-        self.btn_download = ttk.Button(download_frame, text="Download", command=self._download_file)
+        self.btn_download = ttk.Button(download_frame, text="Скачать", command=self._download_file)
         self.btn_download.grid(row=2, column=1, sticky="e", padx=5, pady=5)
 
     # ------------------------------------------------------------------
@@ -351,7 +593,7 @@ class SSHGUI(tk.Tk):
     # ------------------------------------------------------------------
     def _create_output_frame(self, parent):
         output_frame = ttk.LabelFrame(parent, text="Результат")
-        output_frame.grid(row=4, column=0, sticky="nsew", pady=5)
+        output_frame.grid(row=5, column=0, sticky="nsew", pady=5)
 
         output_frame.rowconfigure(0, weight=1)
         output_frame.columnconfigure(0, weight=1)
@@ -371,8 +613,7 @@ class SSHGUI(tk.Tk):
                 self.saved_combos = json.load(f)
         except Exception:
             self.saved_combos = {}
-            messagebox.showwarning("Ошибка",
-                                   "Не удалось загрузить сохранённые соединения.")
+            messagebox.showwarning("Ошибка", "Не удалось загрузить сохранённые соединения.")
         self._refresh_combo_box()
 
     def _refresh_combo_box(self):
@@ -393,20 +634,12 @@ class SSHGUI(tk.Tk):
         self.entry_port.insert(0, str(combo['port']))
         self.entry_user.delete(0, tk.END)
         self.entry_user.insert(0, combo['user'])
-        
-        # Очищаем поле пароля
         self.entry_pass.delete(0, tk.END)
-        
-        # Определяем, зашифрован пароль или нет
         password = combo['password']
-        
-        # Проверяем, не зашифрован ли уже пароль
         if password and is_encrypted(password):
-            # Пароль зашифрован - расшифровываем
             decrypted = decrypt_password(password)
             self.entry_pass.insert(0, decrypted)
         else:
-            # Пароль не зашифрован (обычный текст) - используем как есть
             self.entry_pass.insert(0, password)
 
     def _save_current_combo(self):
@@ -467,24 +700,29 @@ class SSHGUI(tk.Tk):
         self._refresh_combo_box()
 
     def infos(self):
-        messagebox.showinfo("Информация", 
-            "pwd — показать текущую папку (путь)\n"
-            "ls — список файлов в текущей папке (ls -la — показать все, включая скрытые)\n"
-            "cd [путь] — перейти в папку (cd .. — на уровень выше, cd ~ — в домашнюю папку)\n"
-            "mkdir [имя] — создать новую папку\n"
+        messagebox.showinfo("Справка по командам", 
+            "📁 Навигация:\n"
+            "pwd — показать текущую папку\n"
+            "ls — список файлов\n"
+            "ls -la — показать все файлы (включая скрытые)\n"
+            "cd [путь] — перейти в папку\n"
+            "cd .. — на уровень выше\n"
+            "cd ~ — в домашнюю папку\n\n"
+            
+            "📄 Работа с файлами:\n"
+            "cat [файл] — показать содержимое файла\n"
             "touch [файл] — создать пустой файл\n"
-            "rm [файл] — удалить файл (rm -rf [папка] — удалить папку со всем содержимым)\n"
-            "cp [источник] [цель] — копировать файл\n"
-            "mv [источник] [цель] — переместить или переименовать файл\n"
-            "df -h — свободное место на дисках.\n"
-            "cat [файл] — вывести содержимое файла на экран\n"
-            "nano [файл] или vi [файл] — популярные текстовые редакторы\n"
-            "grep [текст] [файл] — поиск строки в файле"
+            "rm [файл] — удалить файл\n"
+            "rm -rf [папка] — удалить папку со всем содержимым\n"
+            "cp [источник] [цель] — копировать\n"
+            "mv [источник] [цель] — переместить/переименовать\n\n"
+            
+            "📊 Система:\n"
+            "df -h — свободное место на дисках\n"
+            "ps aux — список процессов\n"
+            "grep [текст] [файл] — поиск текста в файле"
         )
 
-    # ------------------------------------------------------------------
-    # NEW: History load/save
-    # ------------------------------------------------------------------
     def _load_history(self):
         """Загружаем историю из HISTORY_FILE и заполняем combobox."""
         if os.path.exists(HISTORY_FILE):
@@ -493,12 +731,11 @@ class SSHGUI(tk.Tk):
                     self.history = [line.rstrip("\n")
                                     for line in f if line.strip()]
             except Exception as e:
-                messagebox.showwarning("История",
-                                       f"Не удалось загрузить историю: {e}")
+                messagebox.showwarning("История", f"Не удалось загрузить историю: {e}")
+                self.history = []
         else:
             self.history = []
 
-        # обновляем выпадающий список
         self.entry_custom['values'] = self.history
 
     def _save_history(self, command):
@@ -515,37 +752,34 @@ class SSHGUI(tk.Tk):
                 for c in self.history[:200]:
                     f.write(c + "\n")
         except Exception as e:
-            messagebox.showwarning("История",
-                                   f"Не удалось сохранить историю: {e}")
+            messagebox.showwarning("История", f"Не удалось сохранить историю: {e}")
 
-        # **Важно** – обновляем значения combobox, чтобы новое
-        #        отображалось в выпадающем списке
         self.entry_custom['values'] = self.history
-    # ----------------------------------------------------------------------
-    # Метод удаления выбранной команды из истории
-    # ----------------------------------------------------------------------
+
     def _delete_history_command(self):
-        """Удаляет команду, выбранную в Combobox, из истории."""
-        command = self.entry_custom.get().strip()
-        if not command:
+        current_command = self.entry_custom.get().strip()
+        if not current_command:
             messagebox.showwarning("Внимание", "Нечего удалять – выберите команду из истории.")
             return
-
-        if command not in self.history:
+        if current_command not in self.history:
             messagebox.showinfo("Информация", "Команда уже отсутствует в истории.")
             return
-
-        # Удаляем из списка и сохраняем
-        self.history.remove(command)
+        current_index = -1
+        try:
+            current_index = list(self.entry_custom['values']).index(current_command)
+        except (ValueError, AttributeError, KeyError):
+            pass
+        self.history.remove(current_command)
         self._save_history_to_file()
-        # Обновляем значения combobox
         self.entry_custom['values'] = self.history
-        # Очищаем поле ввода
-        self.entry_custom_var.set('')
+        next_command = ""
+        if self.history:
+            if current_index >= 0 and current_index < len(self.history):
+                next_command = self.history[current_index]
+            elif len(self.history) > 0:
+                next_command = self.history[0]
+        self.entry_custom_var.set(next_command)
 
-    # ----------------------------------------------------------------------
-    # Вспомогательный метод, сохраняющий историю в файл (используется и при удалении)
-    # ----------------------------------------------------------------------
     def _save_history_to_file(self):
         """Записывает первые 200 строк истории в HISTORY_FILE."""
         try:
@@ -553,22 +787,29 @@ class SSHGUI(tk.Tk):
                 for c in self.history[:200]:
                     f.write(c + "\n")
         except Exception as e:
-            messagebox.showwarning("История",
-                                   f"Не удалось сохранить историю: {e}")
+            messagebox.showwarning("История", f"Не удалось сохранить историю: {e}")
 
-    # ------------------------------------------------------------------
-    # Helper methods
-    # ------------------------------------------------------------------
     def get_connection_params(self):
         host = self.entry_host.get().strip()
         port_str = self.entry_port.get().strip()
-        port = int(port_str) if port_str.isdigit() else 22
+        try:
+            port = int(port_str) if port_str else 22
+        except ValueError:
+            messagebox.showerror("Ошибка", "Порт должен быть числом.")
+            return None
         user = self.entry_user.get().strip()
         password = self.entry_pass.get()
 
-        if not host or not user or not password:
-            messagebox.showerror("Ошибка", "Пожалуйста, заполните поля подключения.")
+        if not host:
+            messagebox.showerror("Ошибка", "Пожалуйста, укажите хост.")
             return None
+        if not user:
+            messagebox.showerror("Ошибка", "Пожалуйста, укажите логин.")
+            return None
+        if not password:
+            messagebox.showerror("Ошибка", "Пожалуйста, укажите пароль.")
+            return None
+            
         return host, port, user, password
 
     def append_output(self, text):
@@ -577,31 +818,43 @@ class SSHGUI(tk.Tk):
         self.text_output.see("end")
         self.text_output.configure(state="disabled")
 
-    # ------------------------------------------------------------------
-    # Button callbacks
-    # ------------------------------------------------------------------
-    # УДАЛЕНЫ старые методы run_help и run_pwd, так как они больше не используются
-    
+    def _refresh_status(self):
+        """Обновляет статус соединения"""
+        if self.ssh_connection.is_connected():
+            self._update_connection_status(True)
+        else:
+            self._update_connection_status(False)
+
     def run_custom(self):
         command = self.entry_custom.get().strip()
         if not command:
             messagebox.showwarning("Внимание", "Введите команду.")
             return
-        # Сохраняем в историю
+        
         self._save_history(command)
 
-        params = self.get_connection_params()
-        if not params:
-            return
-
+        # Проверяем, есть ли активное соединение
+        if not self.ssh_connection.client or not self.ssh_connection.client.get_transport() or not self.ssh_connection.client.get_transport().is_active():
+            # Если нет соединения, пытаемся установить
+            params = self.get_connection_params()
+            if not params:
+                return
+            
+            host, port, user, password = params
+            if not self.ssh_connection.connect(host, port, user, password, self.append_output):
+                return
+        
+        # Выполняем команду в существующем соединении
         self.append_output(f"=== Выполняется: {command}")
-        threading.Thread(target=ssh_execute,
-                         args=(*params, command, self.append_output),
-                         daemon=True).start()
+        threading.Thread(target=self._execute_in_connection, 
+                        args=(command,), daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # Download functionality
-    # ------------------------------------------------------------------
+    def _execute_in_connection(self, command):
+        """Выполняет команду в существующем соединении в отдельном потоке"""
+        self.ssh_connection.execute(command, self.append_output)
+        # Обновляем статус в GUI
+        self.after(0, self._refresh_status)
+
     def _local_path_for_remote(self, remote_path):
         rel_path = remote_path.lstrip('/')
         downloads_dir = Path.cwd() / "Downloads"
@@ -614,9 +867,15 @@ class SSHGUI(tk.Tk):
         if not remote_path:
             messagebox.showerror("Ошибка", "Пожалуйста, укажите путь к файлу на сервере.")
             return
-        params = self.get_connection_params()
-        if not params:
-            return
+        
+        # Проверяем соединение
+        if not self.ssh_connection.client or not self.ssh_connection.client.get_transport() or not self.ssh_connection.client.get_transport().is_active():
+            params = self.get_connection_params()
+            if not params:
+                return
+            host, port, user, password = params
+            if not self.ssh_connection.connect(host, port, user, password, self.append_output):
+                return
 
         local_path = self._local_path_for_remote(remote_path)
         self.entry_local.config(state="normal")
@@ -625,8 +884,8 @@ class SSHGUI(tk.Tk):
         self.entry_local.config(state="readonly")
 
         self.append_output(f"[INFO] Начинается скачивание: {remote_path} → {local_path}")
-        threading.Thread(target=download_file,
-                         args=(*params, remote_path, str(local_path), self.append_output),
+        threading.Thread(target=self.ssh_connection.download_file,
+                         args=(remote_path, str(local_path), self.append_output),
                          daemon=True).start()
 
 # ----------------------------------------------------------------------
